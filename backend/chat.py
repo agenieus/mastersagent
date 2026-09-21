@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
@@ -17,6 +17,8 @@ from schemas import (
 from auth import get_current_user
 from memory import get_conversation_context
 from ollama_client import stream_response
+from retrieval import retrieve_memories, format_memory_context
+from config import settings
 
 router = APIRouter()
 
@@ -110,10 +112,33 @@ async def rename_conversation(
     return conv
 
 
+async def _run_imdcra_pipeline(
+    user_id: str,
+    user_message: str,
+    recent_context: list,
+):
+    """
+    Background task: runs after the streaming response is complete.
+    Extracts facts, resolves contradictions, stores memories, runs decay.
+    """
+    try:
+        from imdcra_orchestrator import process_turn
+        await process_turn(
+            user_id=user_id,
+            user_message=user_message,
+            recent_context=recent_context,
+            run_decay=True,
+        )
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error(f"[IMDCRA] Pipeline error: {exc}")
+
+
 @router.post("/conversations/{conv_id}/messages")
 async def send_message(
     conv_id: int,
     data: ChatRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -132,7 +157,7 @@ async def send_message(
     db.add(user_msg)
     await db.commit()
 
-    # Load full context (including the user message we just saved)
+    # Load conversation context
     context = await get_conversation_context(conv_id, db)
 
     # Auto-title the conversation from the first user message
@@ -143,10 +168,29 @@ async def send_message(
         )
         await db.commit()
 
+    # ── IMDCRA: Retrieve relevant memories and inject into LLM ────────────
+    user_id_str = str(current_user.id)
+    try:
+        memories = retrieve_memories(
+            user_id=user_id_str,
+            query=data.content,
+            top_k=settings.retrieval_top_k,
+        )
+        memory_context = format_memory_context(memories)
+        memory_count = len(memories)
+    except Exception:
+        memory_context = None
+        memory_count = 0
+    # ─────────────────────────────────────────────────────────────────────
+
+    # Capture a snapshot for the background task (avoid DB session issues)
+    context_snapshot = list(context)
+    user_message_text = data.content
+
     async def generate():
         full_response = ""
         try:
-            async for token in stream_response(context):
+            async for token in stream_response(context, memory_context=memory_context):
                 full_response += token
                 yield f"data: {json.dumps({'token': token})}\n\n"
         except Exception as e:
@@ -168,7 +212,16 @@ async def send_message(
                     .values(updated_at=datetime.now(timezone.utc))
                 )
 
-        yield f"data: {json.dumps({'done': True})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'memory_count': memory_count})}\n\n"
+
+    # ── IMDCRA: Schedule memory pipeline as background task ───────────────
+    background_tasks.add_task(
+        _run_imdcra_pipeline,
+        user_id_str,
+        user_message_text,
+        context_snapshot,
+    )
+    # ─────────────────────────────────────────────────────────────────────
 
     return StreamingResponse(
         generate(),

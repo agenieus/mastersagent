@@ -8,7 +8,14 @@ import { Conversation, Message } from "@/lib/types";
 import Sidebar from "@/components/Sidebar";
 import MessageBubble, { TypingIndicator } from "@/components/MessageBubble";
 import ChatInput from "@/components/ChatInput";
+import MemoryPanel from "@/components/MemoryPanel";
+import MemoryBadge from "@/components/MemoryBadge";
 import styles from "./chat.module.css";
+
+// Extended Message type to hold client-side memory count
+interface ChatMessage extends Message {
+  memoryCount?: number;
+}
 
 export default function ChatPage() {
   const { user, isLoading, logout } = useAuth();
@@ -16,9 +23,10 @@ export default function ChatPage() {
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConvId, setActiveConvId] = useState<number | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingContent, setStreamingContent] = useState("");
+  const [isMemoryPanelOpen, setIsMemoryPanelOpen] = useState(false);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -82,7 +90,7 @@ export default function ChatPage() {
     const targetConvId = activeConvId || conversations[0].id;
 
     // Optimistically add user message
-    const optimisticUserMsg: Message = {
+    const optimisticUserMsg: ChatMessage = {
       id: Date.now(),
       role: "user",
       content,
@@ -97,10 +105,16 @@ export default function ChatPage() {
         targetConvId,
         content,
         (token) => setStreamingContent((prev) => prev + token),
-        () => {
+        (memoryCount) => {
           // Done! We need to reload messages to get the real DB IDs
           setIsStreaming(false);
-          selectConversation(targetConvId);
+          // Load messages and append memoryCount to the last one
+          api.conversations.getMessages(targetConvId).then(msgs => {
+              if (msgs.length > 0 && memoryCount > 0) {
+                  (msgs[msgs.length - 1] as ChatMessage).memoryCount = memoryCount;
+              }
+              setMessages(msgs);
+          });
           loadConversations(); // refresh title if it was auto-generated
         },
         (err) => {
@@ -127,10 +141,16 @@ export default function ChatPage() {
       />
 
       <div className={styles.mainArea}>
-        <div style={{ position: "absolute", top: "1rem", right: "2rem", zIndex: 10 }}>
+        <div style={{ position: "absolute", top: "1rem", right: "2rem", zIndex: 10, display: "flex", gap: "1rem" }}>
+          <button
+            onClick={() => setIsMemoryPanelOpen(!isMemoryPanelOpen)}
+            style={{ color: "var(--accent-color)", fontSize: "0.875rem", background: "none", border: "1px solid var(--accent-color)", padding: "4px 8px", borderRadius: "4px", cursor: "pointer" }}
+          >
+            🧠 Memory {isMemoryPanelOpen ? "Close" : "Panel"}
+          </button>
           <button
             onClick={() => { logout(); router.push("/"); }}
-            style={{ color: "var(--text-muted)", fontSize: "0.875rem" }}
+            style={{ color: "var(--text-muted)", fontSize: "0.875rem", background: "none", border: "none", cursor: "pointer" }}
           >
             Logout
           </button>
@@ -146,11 +166,16 @@ export default function ChatPage() {
           ) : (
             <>
               {messages.map((msg) => (
-                <MessageBubble key={msg.id} message={msg} />
+                <div key={msg.id} style={{ display: "flex", flexDirection: "column", alignItems: msg.role === "assistant" ? "flex-start" : "flex-end" }}>
+                  {msg.role === "assistant" && msg.memoryCount && msg.memoryCount > 0 && (
+                    <MemoryBadge count={msg.memoryCount} />
+                  )}
+                  <MessageBubble message={msg} />
+                </div>
               ))}
               
               {isStreaming && (
-                <>
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start" }}>
                   {streamingContent ? (
                     <MessageBubble
                       message={{
@@ -163,7 +188,7 @@ export default function ChatPage() {
                   ) : (
                     <TypingIndicator />
                   )}
-                </>
+                </div>
               )}
             </>
           )}
@@ -172,6 +197,8 @@ export default function ChatPage() {
 
         <ChatInput onSend={handleSend} disabled={isStreaming} />
       </div>
+
+      <MemoryPanel isOpen={isMemoryPanelOpen} onClose={() => setIsMemoryPanelOpen(false)} />
     </div>
   );
 }

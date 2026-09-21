@@ -81,7 +81,7 @@ export const api = {
       conversationId: number,
       content: string,
       onToken: (token: string) => void,
-      onDone: () => void,
+      onDone: (memoryCount: number) => void,
       onError: (err: string) => void
     ) => {
       const token = getToken();
@@ -106,6 +106,7 @@ export const api = {
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let finalMemoryCount = 0;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -120,7 +121,10 @@ export const api = {
           try {
             const data = JSON.parse(line.slice(6));
             if (data.token) onToken(data.token);
-            if (data.done) onDone();
+            if (data.done) {
+              finalMemoryCount = data.memory_count || 0;
+              onDone(finalMemoryCount);
+            }
             if (data.error) onError(data.error);
           } catch {
             // skip malformed lines
@@ -128,5 +132,16 @@ export const api = {
         }
       }
     },
+  },
+
+  // ── Memory (IMDCRA) ────────────────────────────────────────────────────────
+  memory: {
+    listActive: () => request<import("./types").Memory[]>("/memory/"),
+    listArchived: () => request<import("./types").Memory[]>("/memory/archived"),
+    getStats: () => request<import("./types").MemoryStats>("/memory/stats"),
+    runDecay: () =>
+      request<import("./types").DecayReport>("/memory/run-decay", { method: "POST" }),
+    delete: (memoryId: string) =>
+      request(`/memory/${memoryId}`, { method: "DELETE" }),
   },
 };
